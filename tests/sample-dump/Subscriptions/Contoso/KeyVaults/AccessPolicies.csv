@@ -1,0 +1,2 @@
+VaultName,ObjectId,PermissionsToKeysStr,PermissionsToSecretsStr,PermissionsToCertificatesStr
+myvault,11111111-1111-1111-1111-111111111111,"Get, List","Get, List, Set, Delete, Recover, Backup, Restore, Purge","Get, List"

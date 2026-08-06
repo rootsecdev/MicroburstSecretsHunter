@@ -1,0 +1,3 @@
+ResourceName,ResourceId,Location
+vm-web-01,/subscriptions/99999999-8888-7777-6666-555555555555/resourceGroups/rg-web/providers/Microsoft.Compute/virtualMachines/vm-web-01,eastus
+nsg-default,/subscriptions/99999999-8888-7777-6666-555555555555/resourceGroups/rg-web/providers/Microsoft.Network/networkSecurityGroups/nsg-default,eastus

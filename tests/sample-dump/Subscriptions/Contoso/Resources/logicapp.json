@@ -1,0 +1,7 @@
+{
+  "actions": {
+    "a1": { "inputs": { "password": "@{body('Parse_JSON')?['pwd']}" } },
+    "a2": { "inputs": { "password": "@body('GetCred')" } },
+    "a4": { "inputs": { "password": "[parameters('adminPassword')]" } }
+  }
+}

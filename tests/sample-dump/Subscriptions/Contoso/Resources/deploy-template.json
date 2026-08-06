@@ -1,0 +1,8 @@
+{
+  "parameters": {
+    "adminUsername": { "value": "azureuser" },
+    "adminPassword": { "value": "<provide-at-deploy>" },
+    "clientSecret": { "value": "Abc8Q~xY7zQwErTyUiOpAsDfGhJkLmNbVcXz12" },
+    "subscriptionId": { "value": "99999999-8888-7777-6666-555555555555" }
+  }
+}

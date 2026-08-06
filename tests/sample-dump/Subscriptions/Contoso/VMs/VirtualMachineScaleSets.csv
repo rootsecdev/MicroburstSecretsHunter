@@ -1,0 +1,6 @@
+Name,Location,Secrets,AdminUsername
+vmss-web,eastus,System.Collections.Generic.List`1[Microsoft.Azure.Management.Compute.Models.VaultSecretGroup],azureuser
+vmss-api,eastus,"[
+  { ""sourceVault"": { ""id"": ""/subscriptions/x/resourceGroups/rg/providers/Microsoft.KeyVault/vaults/v"" }, ""vaultCertificates"": [ { ""certificateUrl"": ""https://v.vault.azure.net/secrets/c/abc123"", ""certificateStore"": ""My"" } ] }
+]",azureuser
+vmss-bad,eastus,P@ssw0rdLeakedInSecrets!,azureuser

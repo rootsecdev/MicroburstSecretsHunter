@@ -1,0 +1,9 @@
+Name,Value,Encrypted
+RetryCount,5,False
+ServiceAccountPwd,Wint3r2026Spring!,False
+EncryptedToken,********,True
+TenantId,11111111-2222-3333-4444-555555555555,False
+Config1,P@ssw0rd2026!,False
+Blob9,aB3kZ9mQ2xR7tY1wP0sdEf,False
+Region,eastus2,False
+VmSize,Standard_D2s_v3,False
