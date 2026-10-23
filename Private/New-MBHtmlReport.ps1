@@ -22,6 +22,10 @@ function New-MBHtmlReport {
     $sb = [System.Text.StringBuilder]::new()
     [void]$sb.AppendLine('<!doctype html><html lang="en"><head><meta charset="utf-8">')
     [void]$sb.AppendLine('<meta name="viewport" content="width=device-width, initial-scale=1">')
+    # Defence in depth: every scanned value is HTML-encoded, but the report is
+    # opened by analysts and shared with clients, so also forbid any network
+    # access or script beyond the page's own inline filter code.
+    [void]$sb.AppendLine('<meta http-equiv="Content-Security-Policy" content="default-src ''none''; style-src ''unsafe-inline''; script-src ''unsafe-inline''">')
     [void]$sb.AppendLine('<title>MicroBurst Secrets Hunter Report</title>')
     [void]$sb.AppendLine(@'
 <style>
@@ -54,6 +58,7 @@ td.ctx{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px
 .muted{color:var(--muted)}
 footer{padding:16px 28px;color:var(--muted);font-size:12px;border-top:1px solid var(--border)}
 .empty{padding:40px;text-align:center;color:#7ee787;font-size:16px}
+.note{margin:0 0 20px;padding:10px 16px;border-radius:8px;background:var(--panel);border:1px solid var(--border);color:var(--muted)}
 .warn{margin:0 0 20px;padding:12px 16px;border-radius:8px;background:#3d2b00;border:1px solid #bf8700;color:#ffd866;font-weight:600}
 </style>
 '@)
@@ -78,6 +83,10 @@ footer{padding:16px 28px;color:var(--muted);font-size:12px;border-top:1px solid 
         if ($ScanInfo.FilesUnreadable  -gt 0) { $parts += ('{0} unreadable' -f $ScanInfo.FilesUnreadable) }
         [void]$sb.AppendLine(('<div class="warn">&#9888; {0} file(s) were NOT scanned ({1}) and are not represented below.</div>' -f `
             $skipped, (ConvertTo-HtmlText ($parts -join ', '))))
+    }
+
+    if ($ScanInfo.Suppressed -gt 0) {
+        [void]$sb.AppendLine(('<div class="note">{0} finding(s) were suppressed by an analyst suppression file and are not listed below.</div>' -f [int]$ScanInfo.Suppressed))
     }
 
     if ($ScanInfo.Unredacted) {

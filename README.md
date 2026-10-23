@@ -38,26 +38,31 @@ redacted *before* they are truncated, and every secret found on a line is
 redacted out of every finding's context on that line, so no plaintext survives
 in a report. When triaging false positives it's often faster to see the full value —
 pass **`-ShowSecrets`** to emit unredacted values everywhere (console, CSV,
-HTML). The console and HTML then carry a clear warning banner, and the reports
+HTML, JSON, SARIF). The console and HTML then carry a clear warning banner, and the reports
 must be treated as live credential material:
 
 ```powershell
 Invoke-MBSecretScan -Path .\dump -ShowSecrets        # raw values, for local triage
 ```
 
-Works on **Windows PowerShell 5.1** and **PowerShell 7+** (Windows, Linux, macOS).
+Works on **PowerShell 7+** (Windows, Linux, macOS).
 
 ---
 
 ## What you get
 
-Every run produces three things:
+Every run produces:
 
 | Output | Description |
 | --- | --- |
 | **Console summary** | Color-coded counts by severity/category plus the top Critical/High findings. |
 | **`findings.csv`** | One row per finding (severity, rule, file, line, redacted value, context) for triage in Excel. Fields carrying scanned content are escaped against spreadsheet formula injection. |
-| **`report.html`** | Self-contained HTML report (no external assets) with severity cards, live text filter, and severity toggles — shareable with the client. |
+| **`report.html`** | Self-contained HTML report (no external assets, locked down by a Content-Security-Policy) with severity cards, live text filter, and severity toggles — shareable with the client. |
+| **`findings.json`** | Scan metadata plus every finding, for scripting and tooling (`-NoJson` to skip). |
+| **`findings.sarif`** | Optional SARIF 2.1.0 log for code-scanning tools (`-Sarif`). |
+
+Each output folder also gets a small `.mbsecretscan-output` marker file so a
+later scan whose root contains it skips it (see *Coverage limits*).
 
 The cmdlet also emits finding objects to the pipeline, so you can post-process:
 
@@ -77,16 +82,32 @@ $f | Where-Object Severity -eq 'Critical' | Format-Table File,Line,RuleName
 | Service Bus / Event Hub `SharedAccessKey` | Critical | Messaging resource configs |
 | Cosmos DB account key | Critical | App settings |
 | PEM private key block | Critical | Key Vault / certificate exports |
+| Azure Function key (`?code=` in a Function / Logic App URL, `x-functions-key`) | High | Logic App definitions, app settings |
+| ARM parameter value (`"adminPassword": { "value": "..." }`, including pretty-printed across lines) | High | ARM templates / parameter files |
 | Azure Redis Cache password | High | Cache connection strings |
 | Azure AD client secret (post-2021 `…Q~…` format) | High | ARM templates, app settings |
 | SAS token / `sig=` parameter | High | Storage SAS URLs |
 | JWT / bearer token | High | Cached tokens, configs |
-| Certificate / key file present (`.pfx`, `.pem`, `.key`, …) | High | Anywhere in the dump |
-| Generic `password` / `pwd` assignment | High | Automation variables, app settings, ARM params |
-| Generic `secret` / `client_secret` assignment | High | App settings, templates |
+| Certificate / key file present (`.pfx`, `.p12`, `.pem`, `.key`, `.jks`, `.ppk`, …) | High | Anywhere in the dump |
+| Certificate file present (`.cer`, `.crt`, `.der` — usually public) | Low | Anywhere in the dump |
+| Generic `password` / `pwd` assignment, including compound names (`administratorLoginPassword`, `userPWD`) | High | Automation variables, app settings, ARM params, publish profiles |
+| Generic `secret` / `client_secret` assignment, including compound names (`servicePrincipalSecret`) | High | App settings, templates |
 | AWS access key / GitHub / Slack tokens | High/Med | Foreign creds stored in Azure apps |
 | Generic `api_key` / `access_key` / `connectionstring` | Medium | App settings |
 | High-entropy string (heuristic) | Low | Backstop for unknown key formats — **opt-in** via `-IncludeEntropy` |
+
+The generic keyword rules match the keyword at the *end* of a compound name
+(`sqlAdminPassword`, `servicePrincipalSecret`, `storageAccountKey`), so
+metadata fields that merely start with one (`passwordLastSet`, `secretName`)
+stay quiet. A generic value stops before whitespace followed by another
+`key=`/`key:`, so `password=abc apikey=xyz` yields two clean findings, while a
+passphrase containing spaces is still captured whole.
+
+**One finding per secret.** When several rules match the same value on the
+same line (a storage connection string *and* the bare 88-char key; a SQL
+connection string *and* the generic password rule), only the highest-severity
+match is kept. On a tie, a format-specific rule (`AZ_AAD_CLIENT_SECRET`) wins
+over a keyword-driven one (`GENERIC_*`, `ARM_PARAM_*`, `CSV_*`).
 
 The full, editable rule set lives in **`Private/Get-MBSignature.ps1`**. Each rule
 is a `[PSCustomObject]` with these fields:
@@ -96,7 +117,7 @@ is a `[PSCustomObject]` with these fields:
 | `Id`, `Name`, `Category`, `Severity` | yes | Identity and how the finding is reported and sorted. |
 | `Pattern` | yes | The regex. Compiled once per scan. |
 | `ValueGroup` | yes | Which capture group holds the secret (`0` = whole match). Drives redaction. |
-| `MultiLine` | no | Evaluate against whole-file text instead of line by line (PEM blocks). Every match is reported, not just the first. |
+| `MultiLine` | no | Evaluate against whole-file text instead of line by line (PEM blocks, pretty-printed ARM parameters). Every match is reported, not just the first, on the line where `ValueGroup` starts. |
 | `CaseSensitive` | no | Opt out of the default `IgnoreCase` compilation. Set this for formats defined case-sensitively (`AKIA`, `ghp_`, `eyJ`, `Q~`) — without it, arbitrary-case lookalikes match. |
 | `Redact` | no | Set `$false` when the captured value is a label rather than a secret (a PEM header line, a certificate file name) so it appears verbatim instead of masked into unreadability. Defaults to redacting. |
 
@@ -119,7 +140,7 @@ pairing** (`Private/Get-MBCsvFinding.ps1`):
 
 Values that a high-confidence rule already covers (connection strings, storage
 keys, SAS) are deferred to the raw-line pass for tighter redaction, and findings
-are de-duplicated by category so the same secret is never reported twice. If a
+are de-duplicated per value and line so the same secret is never reported twice. If a
 file can't be parsed as a CSV, the scanner falls back to the normal raw-line
 scan automatically.
 
@@ -211,8 +232,48 @@ The scanner filters these out:
 | `-ShowSecrets` | off | Emit **unredacted** values in all output to speed up false-positive triage. Reports become live credential material. |
 | `-MaxFileSizeMB` | `50` | Skip files larger than this. Skipped files are warned about and counted in the summary and HTML report. |
 | `-IncludeExtension` | common text types | Override which file types are scanned (a leading dot is optional). |
-| `-NoCsv` / `-NoHtml` | off | Skip a report format. |
+| `-SuppressionFile` | none | JSON file of known false positives to drop (see below). |
+| `-Sarif` | off | Also write `findings.sarif`. |
+| `-NoCsv` / `-NoHtml` / `-NoJson` | off | Skip a report format. |
 | `-Quiet` | off | Suppress the console summary (objects still returned). |
+
+`Scan-MicroBurst.ps1` accepts all of the above plus two options for scripted
+and CI use:
+
+| Parameter | Purpose |
+| --- | --- |
+| `-FailOnSeverity <Critical\|High\|Medium\|Low\|Info>` | Exit with code `1` when any finding is at or above that severity (`0` otherwise). |
+| `-PassThru` | Emit the finding objects (the wrapper otherwise only prints the summary). |
+
+```powershell
+.\Scan-MicroBurst.ps1 -Path .\dump -Quiet -Sarif -FailOnSeverity High
+```
+
+### Suppressing known false positives
+
+When you re-scan the same client, pass `-SuppressionFile` with the false
+positives you have already triaged. It's a JSON array; a finding is dropped when
+it matches **every** field an entry sets:
+
+```json
+[
+  { "RuleId": "CERT_FILE", "Reason": "public certs, reviewed" },
+  { "File": "*/Runbooks/Build-*.ps1", "RuleId": "GENERIC_PASSWORD", "Reason": "test fixture" },
+  { "File": "*appsettings.csv", "ValuePattern": "^dummy-", "Reason": "placeholder values" }
+]
+```
+
+| Field | Matches |
+| --- | --- |
+| `RuleId`, `Category` | Exact value. |
+| `File` | Wildcard against the path relative to the scan root, using `/` separators. |
+| `Line` | Exact line number. |
+| `ValuePattern` | Regex against the **unredacted** value. |
+| `Reason` | Free text for your notes; not used for matching. |
+
+An entry that sets none of the matching fields would hide every finding, so it
+is rejected. The suppressed count is shown in the console summary, the HTML
+report, and `findings.json` — suppressed findings are never silently lost.
 
 ---
 
@@ -230,10 +291,19 @@ Private/
   MBHelpers.ps1                  Entropy, redaction, context rendering,
                                  CSV field escaping, line windowing,
                                  placeholder/GUID filters
+  MBSuppression.ps1              Suppression file loading / matching
   Write-MBConsoleSummary.ps1     Console output
   New-MBHtmlReport.ps1           HTML report generator
+  New-MBSarifReport.ps1          SARIF 2.1.0 writer
 tests/
+  MicroBurstSecretsHunter.Tests.ps1   Pester tests
   sample-dump/                   Example Get-AzDomainInfo-style fixture
+```
+
+Run the tests (Pester 5+) from the project folder:
+
+```powershell
+Invoke-Pester ./tests
 ```
 
 To try it against the bundled sample:
@@ -252,12 +322,21 @@ reads as "nothing found here". So the scanner is explicit about them:
 - Files over `-MaxFileSizeMB` produce a `Write-Warning` naming them, a
   `NOT scanned` line in the console summary, and a banner on the HTML report.
 - Unreadable files (locked, permission-denied) are counted the same way; run
-  with `-Verbose` for the individual paths.
+  with `-Verbose` for the individual paths. A read error never aborts the scan.
+- **Earlier scanner output is skipped.** Running twice from inside a dump
+  folder with the default output location would otherwise re-scan the first
+  run's `findings.csv` / `report.html` and report its findings again (and,
+  after a `-ShowSecrets` run, re-read plaintext). Folders with the
+  `.mbsecretscan-output` marker, and default-named `MBSecretScan-<timestamp>`
+  report folders from older versions, are skipped with a warning. Pointing
+  `-Path` directly at an old report folder still scans it.
 - Long lines are **not** truncated. Minified single-line JSON is normal in
   Azure exports, and a 14 KB one-line ARM template will happily hide an
   `AdminPassword` past any fixed cut-off, so lines are scanned in overlapping
-  8000-character windows instead. Duplicate hits from the overlap collapse in
-  de-duplication.
+  8000-character windows instead. A match cut off at a window edge is dropped
+  in favour of the overlapping window that holds it whole, and finding context
+  is always taken from the full line, so a secret cut by a window edge cannot
+  slip through redaction.
 
 ---
 

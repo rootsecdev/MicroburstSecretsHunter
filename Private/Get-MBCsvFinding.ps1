@@ -1,4 +1,4 @@
-function Get-MBNameClassification {
+﻿function Get-MBNameClassification {
     <#
     .SYNOPSIS
         Classifies a column header or variable name as a secret type.

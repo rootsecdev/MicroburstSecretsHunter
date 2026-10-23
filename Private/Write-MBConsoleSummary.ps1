@@ -1,4 +1,4 @@
-function Write-MBConsoleSummary {
+﻿function Write-MBConsoleSummary {
     <#
     .SYNOPSIS
         Prints a color-coded summary of findings to the console.
@@ -35,8 +35,15 @@ function Write-MBConsoleSummary {
         Write-Host ("  NOT scanned   : {0} unreadable file(s)" -f $ScanInfo.FilesUnreadable) `
             -ForegroundColor Yellow
     }
+    if ($ScanInfo.PriorOutputSkipped -gt 0) {
+        Write-Host ("  Skipped       : {0} earlier report folder(s) inside the scan root" -f $ScanInfo.PriorOutputSkipped) `
+            -ForegroundColor DarkGray
+    }
     Write-Host ("  Duration      : {0}s" -f $ScanInfo.DurationSec)
     Write-Host ("  Total findings: {0}" -f $ScanInfo.FindingCount)
+    if ($ScanInfo.Suppressed -gt 0) {
+        Write-Host ("  Suppressed    : {0} (via -SuppressionFile)" -f $ScanInfo.Suppressed) -ForegroundColor DarkGray
+    }
     Write-Host ''
 
     if (-not $Findings -or $Findings.Count -eq 0) {

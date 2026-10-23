@@ -1,4 +1,4 @@
-# Internal helper functions for MicroBurstSecretsHunter.
+﻿# Internal helper functions for MicroBurstSecretsHunter.
 
 function Get-MBEntropy {
     <#

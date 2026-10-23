@@ -1,4 +1,4 @@
-function Invoke-MBSecretScan {
+﻿function Invoke-MBSecretScan {
     <#
     .SYNOPSIS
         Scans a MicroBurst Get-AzDomainInfo dump (or any folder of text files)
@@ -12,8 +12,8 @@ function Invoke-MBSecretScan {
         positives.
 
         Findings are emitted as objects, printed as a color-coded console
-        summary, and (by default) written to a CSV and a self-contained HTML
-        report. Secret values are redacted in all output so the reports are
+        summary, and (by default) written to CSV, JSON and a self-contained
+        HTML report (optionally SARIF). Secret values are redacted in all output so the reports are
         safe to share with a client.
 
         Designed for read-only audit use against output you already collected
@@ -57,6 +57,28 @@ function Invoke-MBSecretScan {
         HTML) to speed up triage of false positives. The reports become
         sensitive credential material — handle and delete accordingly.
         Off by default (values are redacted).
+
+    .PARAMETER SuppressionFile
+        JSON file of known false positives to drop from the results. It is an
+        array of objects; a finding is suppressed when it matches EVERY field an
+        entry specifies:
+
+            RuleId        exact rule id            (e.g. "GENERIC_PASSWORD")
+            Category      exact category           (e.g. "Heuristic")
+            File          wildcard on the relative path, '/' separated
+                          (e.g. "*/Runbooks/*.ps1")
+            Line          exact line number
+            ValuePattern  regex tested against the UNREDACTED value
+            Reason        free text, ignored by matching
+
+        An entry must set at least one matching field. The suppressed count is
+        shown in the console summary and the reports.
+
+    .PARAMETER Sarif
+        Also write findings.sarif (SARIF 2.1.0) for code-scanning tools.
+
+    .PARAMETER NoJson
+        Do not write findings.json.
 
     .PARAMETER NoCsv
         Do not write the CSV report.
@@ -107,6 +129,14 @@ function Invoke-MBSecretScan {
 
         [switch]$ShowSecrets,
 
+        [ValidateScript({
+            if (Test-Path -LiteralPath $_ -PathType Leaf) { $true }
+            else { throw "Suppression file '$_' does not exist." }
+        })]
+        [string]$SuppressionFile,
+
+        [switch]$Sarif,
+        [switch]$NoJson,
         [switch]$NoCsv,
         [switch]$NoHtml,
         [switch]$Quiet
@@ -143,6 +173,18 @@ function Invoke-MBSecretScan {
                            "'$OutputDirectory' will be excluded from this scan.")
         }
 
+        # Mark the folder as scanner output so later runs whose scan root
+        # contains it (e.g. two runs from inside the dump folder with the
+        # default output location) skip it instead of re-reading old reports.
+        $markerName = '.mbsecretscan-output'
+        try {
+            Set-Content -LiteralPath (Join-Path $OutputDirectory $markerName) -Encoding UTF8 ``
+                -Value 'Created by MicroBurstSecretsHunter. Folders holding this file are excluded from scans.'
+        } catch { Write-Verbose "Could not write output marker: $_" }
+
+        $suppressions = @()
+        if ($SuppressionFile) { $suppressions = @(Read-MBSuppressionFile -Path $SuppressionFile) }
+
         Write-Verbose "Scanning : $root"
         Write-Verbose "Report to: $OutputDirectory"
 
@@ -162,6 +204,7 @@ function Invoke-MBSecretScan {
                 Severity   = $s.Severity
                 ValueGroup = $s.ValueGroup
                 MultiLine  = [bool]$s.MultiLine
+                CaseSensitive = [bool]$s.CaseSensitive
                 # Absent Redact means "redact" — only a rule that explicitly opts
                 # out (a PEM header, a file name) is shown verbatim.
                 Redact     = ($null -eq $s.Redact -or [bool]$s.Redact)
@@ -170,6 +213,17 @@ function Invoke-MBSecretScan {
         }
         $singleLineSigs = @($signatures | Where-Object { -not $_.MultiLine })
         $multiLineSigs  = @($signatures | Where-Object { $_.MultiLine })
+        # One alternation of every single-line rule, evaluated once per segment.
+        # Most lines in a dump match nothing; rejecting them with a single
+        # IsMatch avoids running each rule's loop in PowerShell. Matching is
+        # equivalent to "any rule matches": case-sensitive rules keep their
+        # semantics via a scoped (?-i:...) group.
+        $prefilter = [regex]::new(
+            (($singleLineSigs | ForEach-Object {
+                if ($_.CaseSensitive) { '(?-i:' + $_.Regex.ToString() + ')' }
+                else                  { '(?:'   + $_.Regex.ToString() + ')' }
+            }) -join '|'),
+            ($reCompiled -bor $reIgnore))
         # High-confidence patterns used to defer structured-CSV values to the raw
         # pass (which redacts the precise value rather than the whole cell).
         $specializedRegex = @($singleLineSigs | Where-Object { $_.Id -notlike 'GENERIC_*' } | ForEach-Object { $_.Regex })
@@ -200,8 +254,32 @@ function Invoke-MBSecretScan {
         # the path plus a trailing separator so a sibling that merely shares the name
         # prefix (e.g. output '…/MBScan', file '…/MBScan-old/x') isn't wrongly skipped.
         $outPrefix = $OutputDirectory.TrimEnd('\','/') + $sep
-        $allFiles = Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue |
-            Where-Object { -not $_.FullName.StartsWith($outPrefix, [StringComparison]::OrdinalIgnoreCase) }
+        $allFiles = @(Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue |
+            Where-Object { -not $_.FullName.StartsWith($outPrefix, [StringComparison]::OrdinalIgnoreCase) })
+
+        # Earlier scanner output inside the scan root: folders carrying the
+        # marker file, plus default-named folders from versions that predate
+        # the marker. Re-scanning them reports the previous run's findings as
+        # new ones (and, after a -ShowSecrets run, re-ingests plaintext). The
+        # scan root itself is never excluded: pointing -Path at an old report
+        # folder is deliberate.
+        $rootTrim = $root.TrimEnd('\','/')
+        $priorOut = @(@(
+            $allFiles | Where-Object { $_.Name -eq $markerName } | ForEach-Object { $_.DirectoryName }
+            $allFiles | Where-Object {
+                $_.Name -in 'findings.csv','report.html' -and $_.Directory.Name -match '^MBSecretScan-\d{8}-\d{6}$'
+            } | ForEach-Object { $_.DirectoryName }
+        ) | Where-Object { -not $_.TrimEnd('\','/').Equals($rootTrim, [StringComparison]::OrdinalIgnoreCase) } |
+            Sort-Object -Unique)
+        if ($priorOut.Count -gt 0) {
+            Write-Warning ("Skipping {0} earlier scanner output folder(s) inside the scan root: {1}" -f `
+                $priorOut.Count, (($priorOut | ForEach-Object { $_.Substring($root.Length).TrimStart('\','/') }) -join ', '))
+            $priorPrefixes = @($priorOut | ForEach-Object { $_.TrimEnd('\','/') + $sep })
+            $allFiles = @($allFiles | Where-Object {
+                $full = $_.FullName
+                -not ($priorPrefixes | Where-Object { $full.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) })
+            })
+        }
 
         $wanted = @($allFiles | Where-Object { $incExt.ContainsKey($_.Extension.ToLowerInvariant()) })
         $files        = @($wanted | Where-Object { $_.Length -le $maxBytes })
@@ -222,7 +300,11 @@ function Invoke-MBSecretScan {
         }
 
         # Certificate / key material files are findings just by existing.
-        $keyFileExt = @('.pfx','.p12','.pem','.key','.cer','.crt','.der','.jks','.keystore','.ppk')
+        # Containers that normally hold a private key are High; .cer/.crt/.der
+        # are usually public certificates, so they are Low (a PEM private key
+        # inside one is still caught as Critical by PRIVATE_KEY_BLOCK).
+        $keyFileExt        = @('.pfx','.p12','.pem','.key','.jks','.keystore','.ppk')
+        $publicCertFileExt = @('.cer','.crt','.der')
 
         # Files that plausibly contain code, where a value shaped like a PowerShell
         # variable or a cmdlet call really is an expression rather than a secret.
@@ -231,7 +313,9 @@ function Invoke-MBSecretScan {
                          '.yaml','.yml','.html','.htm','.md')) { $codeExt[$e] = $true }
 
         $findings = [System.Collections.Generic.List[object]]::new()
-        $seen     = [System.Collections.Generic.HashSet[string]]::new()
+        $seen     = [System.Collections.Generic.Dictionary[string,int]]::new()
+        $sevRank  = @{ Critical = 0; High = 1; Medium = 2; Low = 3; Info = 4 }
+        $keywordRule = '^(GENERIC_|ARM_PARAM_|CSV_|HIGH_ENTROPY)'
 
         function Add-Finding {
             param($File, [int]$Line, $Sig, [string]$Value, [string]$Context, [string]$Note)
@@ -241,12 +325,16 @@ function Invoke-MBSecretScan {
             # those only made the report unreadable.
             $noRedact = ($null -ne $Sig.PSObject.Properties['Redact']) -and (-not $Sig.Redact)
             $shown = if ($noRedact) { $Value } else { Protect-MBValue $Value }
-            # Dedup on category (not rule id) so the same secret found two ways
-            # (e.g. a structured CSV pair and a raw-line regex) collapses to one.
-            # Use the raw value for the key so dedup is stable regardless of -ShowSecrets.
-            $key = '{0}|{1}|{2}|{3}' -f $rel, $Line, $Sig.Category, $Value
-            if (-not $seen.Add($key)) { return }
-            $findings.Add([PSCustomObject]@{
+            # One finding per secret per line: the same value matched by several
+            # rules (a storage connection string AND the bare 88-char key, a SQL
+            # connection string AND the generic password rule) collapses to the
+            # highest-severity rule. On a tie a format-specific rule (AZ_AAD_*,
+            # SQL_CONNSTR_PWD, ...) beats a keyword-driven one (GENERIC_*,
+            # ARM_PARAM_*, CSV_*), since its name says what the secret is;
+            # otherwise the first-added is kept. Keyed on the raw value so dedup
+            # is stable regardless of -ShowSecrets.
+            $key = '{0}|{1}|{2}' -f $rel, $Line, $Value.Trim()
+            $finding = [PSCustomObject]@{
                 Severity     = $Sig.Severity
                 Category     = $Sig.Category
                 RuleId       = $Sig.Id
@@ -257,7 +345,21 @@ function Invoke-MBSecretScan {
                 Value        = $shown
                 Context      = $Context
                 Note         = $Note
-            })
+                RawValue     = $Value
+            }
+            $idx = 0
+            if ($seen.TryGetValue($key, [ref]$idx)) {
+                $prev    = $findings[$idx]
+                $newRank = $sevRank[$Sig.Severity]
+                $oldRank = $sevRank[$prev.Severity]
+                if ($newRank -lt $oldRank -or
+                    ($newRank -eq $oldRank -and $prev.RuleId -match $keywordRule -and $Sig.Id -notmatch $keywordRule)) {
+                    $findings[$idx] = $finding
+                }
+                return
+            }
+            $seen[$key] = $findings.Count
+            $findings.Add($finding)
         }
 
         $fileCount = 0
@@ -287,54 +389,85 @@ function Invoke-MBSecretScan {
                 }
             }
 
-            # ---- multi-line / whole-file rules (private keys) ---- #
-            $rawText = $null
-            if ($multiLineSigs.Count -gt 0) {
-                try { $rawText = [System.IO.File]::ReadAllText($file.FullName) } catch { $rawText = $null }
-                if ($rawText) {
-                    foreach ($sig in $multiLineSigs) {
-                        # Every match, not just the first: a single file can hold
-                        # several PEM blocks (a bundle, a concatenated chain).
-                        foreach ($m in $sig.Regex.Matches($rawText)) {
-                            $lineNo = Get-MBLineNumber -Text $rawText -Index $m.Index
-                            Add-Finding -File $file -Line $lineNo -Sig $sig `
-                                -Value $m.Value -Context $m.Value.Substring(0,[Math]::Min(60,$m.Value.Length)) `
-                                -Note 'Whole-file match'
-                        }
-                    }
+            # ---- read once ---- #
+            # The whole file is read a single time and serves both the
+            # multi-line rules and the per-line pass. (A lazy ReadLines
+            # enumeration could also throw mid-loop, outside any handler, and
+            # abort the entire scan on one bad file.)
+            try { $rawText = [System.IO.File]::ReadAllText($file.FullName) }
+            catch {
+                Write-Verbose "Skipped (unreadable): $($file.FullName) - $($_.Exception.Message)"
+                $unreadable.Add($file.FullName.Substring($root.Length).TrimStart('\','/'))
+                continue
+            }
+            if ([string]::IsNullOrEmpty($rawText)) { continue }
+
+            # ---- multi-line / whole-file rules (PEM blocks, ARM parameters) ---- #
+            foreach ($sig in $multiLineSigs) {
+                # Every match, not just the first: a single file can hold
+                # several PEM blocks (a bundle, a concatenated chain).
+                foreach ($m in $sig.Regex.Matches($rawText)) {
+                    $g = if ($sig.ValueGroup -gt 0 -and $m.Groups.Count -gt $sig.ValueGroup) {
+                        $m.Groups[$sig.ValueGroup]
+                    } else { $m }
+                    $val = $g.Value
+                    if (Test-MBPlaceholder -Value $val -CodeContext:$isCode) { continue }
+                    if (Test-MBIsGuid $val) { continue }
+
+                    # Report on, and take context from, the line the value sits on.
+                    $ls = $rawText.LastIndexOf("`n", [Math]::Max(0, $g.Index - 1)) + 1
+                    if ($g.Index -eq 0) { $ls = 0 }
+                    $le = $rawText.IndexOf("`n", $g.Index)
+                    if ($le -lt 0) { $le = $rawText.Length }
+                    $valueLine = $rawText.Substring($ls, $le - $ls).TrimEnd("`r")
+                    $ctx = if ($sig.Redact) {
+                        Get-MBContext -Line $valueLine -Value $val -AllValues @($val)
+                    } else { $val }
+                    Add-Finding -File $file -Line (Get-MBLineNumber -Text $rawText -Index $g.Index) -Sig $sig `
+                        -Value $val -Context $ctx -Note 'Whole-file match'
                 }
             }
 
             # ---- per-line rules + entropy ---- #
-            try { $lines = [System.IO.File]::ReadLines($file.FullName) }
-            catch {
-                Write-Verbose "Skipped (unreadable): $($file.FullName)"
-                $unreadable.Add($file.FullName.Substring($root.Length).TrimStart('\','/'))
-                continue
-            }
-
+            $reader = [System.IO.StringReader]::new($rawText)
             $lineNo = 0
-            foreach ($line in $lines) {
+            while ($null -ne ($line = $reader.ReadLine())) {
                 $lineNo++
                 if ([string]::IsNullOrWhiteSpace($line)) { continue }
 
                 # Over-long lines are scanned in overlapping windows instead of
                 # being truncated, so a secret late in a minified JSON blob is
                 # still found. Overlap duplicates collapse in Add-Finding's dedup.
-                $segments = Get-MBLineSegment -Line $line -MaxLength $maxLineLength -Overlap $lineOverlap
+                # (@() keeps a single short line an array; the helper is only
+                # called when the line actually needs splitting.)
+                $segments = @(if ($line.Length -le $maxLineLength) { $line } else {
+                    Get-MBLineSegment -Line $line -MaxLength $maxLineLength -Overlap $lineOverlap
+                })
 
                 # Hits are collected for the whole line before any context is
                 # rendered, so every secret on the line can be redacted out of
-                # every finding's context — including a secret that a segment
-                # boundary cut in half, which would otherwise survive as a raw
-                # fragment in a neighbouring finding's context.
+                # every finding's context. Context is cut from the FULL line,
+                # not the window the hit came from: a window can end mid-secret,
+                # and that cut fragment matches no complete value, so it would
+                # survive redaction in a neighbouring finding's context.
                 $lineHits = [System.Collections.Generic.List[object]]::new()
 
-                foreach ($segment in $segments) {
+                for ($si = 0; $si -lt $segments.Count; $si++) {
+                    $segment = $segments[$si]
+                    if (-not $IncludeEntropy -and -not $prefilter.IsMatch($segment)) { continue }
                     $hits = [System.Collections.Generic.List[object]]::new()
+
+                    # A match touching a window edge that the line continues past
+                    # may be cut short; the overlapping neighbour window holds it
+                    # whole, so the cut copy is dropped rather than reported as a
+                    # second, truncated finding.
+                    $cutLeft  = $si -gt 0
+                    $cutRight = $si -lt ($segments.Count - 1)
 
                     foreach ($sig in $singleLineSigs) {
                         foreach ($m in $sig.Regex.Matches($segment)) {
+                            if ($cutLeft  -and $m.Index -eq 0) { continue }
+                            if ($cutRight -and ($m.Index + $m.Length) -ge $segment.Length) { continue }
                             $val = if ($sig.ValueGroup -gt 0 -and $m.Groups.Count -gt $sig.ValueGroup) {
                                 $m.Groups[$sig.ValueGroup].Value
                             } else { $m.Value }
@@ -349,6 +482,8 @@ function Invoke-MBSecretScan {
                     # ---- entropy heuristic (only when no stronger rule fired) ---- #
                     if ($IncludeEntropy -and $hits.Count -eq 0) {
                         foreach ($tm in $entropyToken.Matches($segment)) {
+                            if ($cutLeft  -and $tm.Index -eq 0) { continue }
+                            if ($cutRight -and ($tm.Index + $tm.Length) -ge $segment.Length) { continue }
                             $tok = $tm.Value
                             if ($tok.Length -lt 24) { continue }
                             if (Test-MBIsGuid $tok) { continue }
@@ -379,21 +514,19 @@ function Invoke-MBSecretScan {
 
                     # The entropy backstop stays per-segment: it only fires where
                     # no stronger rule matched in that window.
-                    foreach ($h in $hits) {
-                        $h | Add-Member -NotePropertyName Segment -NotePropertyValue $segment
-                        $lineHits.Add($h)
-                    }
+                    foreach ($h in $hits) { $lineHits.Add($h) }
                 }
 
                 if ($lineHits.Count -gt 0) {
                     $allValues = @($lineHits | ForEach-Object { $_.Value })
                     foreach ($hit in $lineHits) {
-                        $ctx = Get-MBContext -Line $hit.Segment -Value $hit.Value -AllValues $allValues
+                        $ctx = Get-MBContext -Line $line -Value $hit.Value -AllValues $allValues
                         Add-Finding -File $file -Line $lineNo -Sig $hit.Sig `
                             -Value $hit.Value -Context $ctx -Note $hit.Note
                     }
                 }
             }
+            $reader.Dispose()
         }
         if (-not $Quiet) { Write-Progress -Activity 'Scanning MicroBurst output' -Completed }
 
@@ -402,25 +535,47 @@ function Invoke-MBSecretScan {
         }
 
         # ---- certificate / key files present on disk ---- #
+        # The value is the file name, not a secret — masking it made the
+        # finding unreadable ("exported.pem" -> "exp*********").
+        $keyFileSig = [PSCustomObject]@{
+            Id = 'KEY_MATERIAL_FILE'; Name = 'Certificate / key material file'
+            Category = 'PrivateKey'; Severity = 'High'; ValueGroup = 0
+            MultiLine = $false; Redact = $false
+        }
+        $publicCertSig = [PSCustomObject]@{
+            Id = 'CERT_FILE'; Name = 'Certificate file (usually public)'
+            Category = 'Certificate'; Severity = 'Low'; ValueGroup = 0
+            MultiLine = $false; Redact = $false
+        }
         foreach ($f in $allFiles) {
-            if ($keyFileExt -contains $f.Extension.ToLowerInvariant()) {
-                $sig = [PSCustomObject]@{
-                    Id = 'KEY_MATERIAL_FILE'; Name = 'Certificate / key material file'
-                    Category = 'PrivateKey'; Severity = 'High'; ValueGroup = 0
-                    MultiLine = $false
-                    # The value is the file name, not a secret — masking it made
-                    # the finding unreadable ("exported.pem" -> "exp*********").
-                    Redact = $false
-                }
-                Add-Finding -File $f -Line 0 -Sig $sig -Value $f.Name `
+            $fx = $f.Extension.ToLowerInvariant()
+            if ($keyFileExt -contains $fx) {
+                Add-Finding -File $f -Line 0 -Sig $keyFileSig -Value $f.Name `
                     -Context $f.Name -Note 'Key/cert file present in dump'
+            } elseif ($publicCertFileExt -contains $fx) {
+                Add-Finding -File $f -Line 0 -Sig $publicCertSig -Value $f.Name `
+                    -Context $f.Name -Note 'Certificate file present in dump; confirm it holds no private key'
             }
         }
 
+        # ---- analyst suppressions ---- #
+        $suppressedCount = 0
+        if ($suppressions.Count -gt 0) {
+            $kept = [System.Collections.Generic.List[object]]::new()
+            foreach ($fd in $findings) {
+                if (Test-MBSuppressed -Finding $fd -Suppressions $suppressions) { $suppressedCount++ }
+                else { $kept.Add($fd) }
+            }
+            $findings = $kept
+            Write-Verbose "Suppressed $suppressedCount finding(s) via $SuppressionFile"
+        }
+
         # --- order findings by severity --- #
-        $sevRank = @{ Critical = 0; High = 1; Medium = 2; Low = 3; Info = 4 }
-        $ordered = $findings | Sort-Object `
-            @{ Expression = { $sevRank[$_.Severity] } }, Category, File, Line
+        # RawValue only existed for dedup and suppression; it must not reach
+        # the reports or the pipeline (Value is already the redacted form).
+        $ordered = @($findings | Sort-Object `
+            @{ Expression = { $sevRank[$_.Severity] } }, Category, File, Line |
+            Select-Object -Property * -ExcludeProperty RawValue)
 
         # --- write reports --- #
         $scanInfo = [PSCustomObject]@{
@@ -432,13 +587,16 @@ function Invoke-MBSecretScan {
             FilesSkippedSize = $skippedLarge.Count
             FilesUnreadable  = $unreadable.Count
             FindingCount     = $ordered.Count
+            Suppressed       = $suppressedCount
+            PriorOutputSkipped = $priorOut.Count
             EntropyEnabled   = [bool]$IncludeEntropy
             Unredacted       = [bool]$ShowSecrets
         }
 
+        $csvColumns = 'Severity','Category','RuleId','RuleName','File','Line','Value','Context','Note'
         if (-not $NoCsv) {
             $csvPath = Join-Path $OutputDirectory 'findings.csv'
-            if ($ordered) {
+            if ($ordered.Count -gt 0) {
                 # Fields carrying content from the scanned dump are escaped so a
                 # planted value cannot execute as a formula when the report is
                 # opened in Excel / LibreOffice.
@@ -451,9 +609,26 @@ function Invoke-MBSecretScan {
                         @{ Name = 'Note';     Expression = { Protect-MBCsvField $_.Note } } |
                     Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
             } else {
-                '' | Out-File -LiteralPath $csvPath -Encoding UTF8
+                # Header only, so tooling that imports the CSV still sees the schema.
+                (($csvColumns | ForEach-Object { '"{0}"' -f $_ }) -join ',') |
+                    Out-File -LiteralPath $csvPath -Encoding UTF8
             }
             $scanInfo | Add-Member -NotePropertyName CsvReport -NotePropertyValue $csvPath
+        }
+
+        if (-not $NoJson) {
+            $jsonPath = Join-Path $OutputDirectory 'findings.json'
+            [PSCustomObject]@{
+                ScanInfo = $scanInfo
+                Findings = @($ordered | Select-Object -Property ($csvColumns + 'FullPath'))
+            } | ConvertTo-Json -Depth 5 | Out-File -LiteralPath $jsonPath -Encoding UTF8
+            $scanInfo | Add-Member -NotePropertyName JsonReport -NotePropertyValue $jsonPath
+        }
+
+        if ($Sarif) {
+            $sarifPath = Join-Path $OutputDirectory 'findings.sarif'
+            New-MBSarifReport -Findings $ordered -ScanInfo $scanInfo -OutputPath $sarifPath
+            $scanInfo | Add-Member -NotePropertyName SarifReport -NotePropertyValue $sarifPath
         }
 
         if (-not $NoHtml) {

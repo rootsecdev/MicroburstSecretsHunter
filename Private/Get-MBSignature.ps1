@@ -15,7 +15,8 @@ function Get-MBSignature {
             Low      - heuristic / high-entropy candidates needing human triage.
 
         ValueGroup names which capture group holds the sensitive value (for
-        redaction). 0 means the whole match.
+        redaction). 0 means the whole match. This applies to MultiLine rules
+        too: their finding is reported on the line where that group starts.
 
         CaseSensitive suppresses the scanner's default IgnoreCase compilation.
         Set it on rules whose credential format is defined case-sensitively
@@ -33,6 +34,16 @@ function Get-MBSignature {
         # ----------------------------------------------------------------- #
         #  Azure connection strings & keys
         # ----------------------------------------------------------------- #
+        # Cosmos precedes the storage rules: a Cosmos connection string also
+        # contains 'AccountKey=' and would otherwise be labelled as Storage.
+        [PSCustomObject]@{
+            Id         = 'AZ_COSMOS_KEY'
+            Name       = 'Cosmos DB account key'
+            Category   = 'ConnectionString'
+            Severity   = 'Critical'
+            Pattern    = 'AccountEndpoint=https?://[^;]+;AccountKey=([A-Za-z0-9+/]{64,}={0,2})'
+            ValueGroup = 1
+        }
         [PSCustomObject]@{
             Id         = 'AZ_STORAGE_CONNSTR'
             Name       = 'Azure Storage account connection string'
@@ -74,14 +85,6 @@ function Get-MBSignature {
             ValueGroup = 1
         }
         [PSCustomObject]@{
-            Id         = 'AZ_COSMOS_KEY'
-            Name       = 'Cosmos DB account key'
-            Category   = 'ConnectionString'
-            Severity   = 'Critical'
-            Pattern    = 'AccountEndpoint=https?://[^;]+;AccountKey=([A-Za-z0-9+/]{64,}={0,2})'
-            ValueGroup = 1
-        }
-        [PSCustomObject]@{
             Id         = 'AZ_REDIS_KEY'
             Name       = 'Azure Redis Cache password'
             Category   = 'ConnectionString'
@@ -106,7 +109,10 @@ function Get-MBSignature {
             Name       = 'Azure AD application client secret (post-2021 format)'
             Category   = 'Secret'
             Severity   = 'High'
-            Pattern    = '\b([A-Za-z0-9_~.-]{3}[0-9A-Za-z]Q~[A-Za-z0-9_~.-]{31,34})\b'
+            # Lookarounds rather than \b: the secret alphabet includes ~ . - which
+            # are not word characters, so \b dropped or truncated secrets that
+            # begin or end with one of them.
+            Pattern    = '(?<![A-Za-z0-9_~.-])([A-Za-z0-9_~.-]{3}[0-9A-Za-z]Q~[A-Za-z0-9_~.-]{31,34})(?![A-Za-z0-9_~.-])'
             ValueGroup = 1
             CaseSensitive = $true
         }
@@ -166,15 +172,76 @@ function Get-MBSignature {
         }
 
         # ----------------------------------------------------------------- #
+        #  Azure Functions keys
+        # ----------------------------------------------------------------- #
+        [PSCustomObject]@{
+            Id         = 'AZ_FUNCTION_KEY_URL'
+            Name       = 'Azure Function key in URL (code=)'
+            Category   = 'Key'
+            Severity   = 'High'
+            # Function / Logic App callback URLs carry the key as ?code=...
+            # Scoped to azurewebsites.net and /api/ routes so OAuth
+            # authorization codes on arbitrary redirect URLs are not reported.
+            Pattern    = '(?:\.azurewebsites\.net|/api/)[^\s"''?#]*\?(?:[^\s"''#]*&)?code=([A-Za-z0-9_%/+-]{20,}={0,2})'
+            ValueGroup = 1
+        }
+        [PSCustomObject]@{
+            Id         = 'AZ_FUNCTION_KEY_HEADER'
+            Name       = 'Azure Function key header (x-functions-key)'
+            Category   = 'Key'
+            Severity   = 'High'
+            Pattern    = '\bx-functions-key\b\s*["'']?\s*[:=]\s*["'']?([A-Za-z0-9_%/+-]{20,}={0,2})'
+            ValueGroup = 1
+        }
+
+        # ----------------------------------------------------------------- #
+        #  ARM template / parameter-file values
+        # ----------------------------------------------------------------- #
+        # ARM parameters nest the literal one level down:
+        #   "adminPassword": { "value": "..." }
+        # usually pretty-printed across several lines, which the line-based
+        # keyword rules cannot see. MultiLine so \s spans the line breaks; the
+        # finding is reported on the line holding the value.
+        [PSCustomObject]@{
+            Id         = 'ARM_PARAM_PASSWORD'
+            Name       = 'ARM parameter password value'
+            Category   = 'Password'
+            Severity   = 'High'
+            Pattern    = '(?i)"\w*?(?:password|passwd|pwd|passphrase)"\s*:\s*\{\s*"value"\s*:\s*"([^"\r\n]{4,200})"'
+            ValueGroup = 1
+            MultiLine  = $true
+        }
+        [PSCustomObject]@{
+            Id         = 'ARM_PARAM_SECRET'
+            Name       = 'ARM parameter secret / key value'
+            Category   = 'Secret'
+            Severity   = 'High'
+            Pattern    = '(?i)"\w*?(?:secret|api[_-]?key|access[_-]?key|account[_-]?key|token)"\s*:\s*\{\s*"value"\s*:\s*"([^"\r\n]{6,400})"'
+            ValueGroup = 1
+            MultiLine  = $true
+        }
+
+        # ----------------------------------------------------------------- #
         #  Generic keyword = value (the workhorse for app settings,
         #  automation variables, ARM parameters, etc.)
+        #
+        #  Keywords match as the tail of a compound identifier (\w*? prefix):
+        #  "administratorLoginPassword", "userPWD", "servicePrincipalSecret"
+        #  and "storageAccountKey" are the real-world names, and a bare \b
+        #  before the keyword missed all of them. The trailing \b still
+        #  requires the keyword to END the name, so metadata fields such as
+        #  "passwordLastSet" or "secretName" stay quiet.
+        #
+        #  The value stops before whitespace followed by another key= / key:,
+        #  so "password=abc apikey=xyz" captures "abc" rather than the rest of
+        #  the line, while a passphrase containing spaces is still captured.
         # ----------------------------------------------------------------- #
         [PSCustomObject]@{
             Id         = 'GENERIC_PASSWORD'
             Name       = 'Password assignment'
             Category   = 'Password'
             Severity   = 'High'
-            Pattern    = '(?i)\b(?:admin)?(?:password|passwd|pwd)\b\s*["'']?\s*[:=]\s*["'']?([^,;"''\r\n]{4,120})'
+            Pattern    = '(?i)\b\w*?(?:password|passwd|pwd|passphrase)\b\s*["'']?\s*[:=]\s*["'']?((?:(?!\s+[\w.-]+\s*[:=])[^,;"''\r\n]){4,120})'
             ValueGroup = 1
         }
         [PSCustomObject]@{
@@ -182,7 +249,7 @@ function Get-MBSignature {
             Name       = 'Secret / client-secret assignment'
             Category   = 'Secret'
             Severity   = 'High'
-            Pattern    = '(?i)\b(?:client[_-]?secret|clientsecret|secret|secret[_-]?key)\b\s*["'']?\s*[:=]\s*["'']?([^,;"''\r\n]{6,200})'
+            Pattern    = '(?i)\b\w*?(?:secret|secret[_-]?key)\b\s*["'']?\s*[:=]\s*["'']?((?:(?!\s+[\w.-]+\s*[:=])[^,;"''\r\n]){6,200})'
             ValueGroup = 1
         }
         [PSCustomObject]@{
@@ -190,7 +257,7 @@ function Get-MBSignature {
             Name       = 'API key / access key assignment'
             Category   = 'Key'
             Severity   = 'Medium'
-            Pattern    = '(?i)\b(?:api[_-]?key|apikey|access[_-]?key|accountkey|primarykey|secondarykey|x-api-key)\b\s*["'']?\s*[:=]\s*["'']?([^,;"''\r\n]{8,200})'
+            Pattern    = '(?i)\b\w*?(?:api[_-]?key|apikey|access[_-]?key|account[_-]?key|primary[_-]?key|secondary[_-]?key|master[_-]?key|subscription[_-]?key|x-api-key)\b\s*["'']?\s*[:=]\s*["'']?((?:(?!\s+[\w.-]+\s*[:=])[^,;"''\r\n]){8,200})'
             ValueGroup = 1
         }
         [PSCustomObject]@{
@@ -198,7 +265,7 @@ function Get-MBSignature {
             Name       = 'Token / bearer assignment'
             Category   = 'Token'
             Severity   = 'Medium'
-            Pattern    = '(?i)\b(?:auth[_-]?token|access[_-]?token|bearer|sas[_-]?token|connectionstring)\b\s*["'']?\s*[:=]\s*["'']?([^,;"''\r\n]{8,400})'
+            Pattern    = '(?i)\b\w*?(?:auth[_-]?token|access[_-]?token|refresh[_-]?token|bearer|sas[_-]?token|connectionstring)\b\s*["'']?\s*[:=]\s*["'']?((?:(?!\s+[\w.-]+\s*[:=])[^,;"''\r\n]){8,400})'
             ValueGroup = 1
         }
     )
